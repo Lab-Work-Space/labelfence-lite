@@ -169,8 +169,17 @@ def publish_file(tmp: pathlib.Path, final: pathlib.Path, overwrite: bool, handle
     try:
         _verify_published(final, handle, os.lstat(tmp))
     finally:
+        # Best-effort cleanup only: the docstring above promises the caller's ``handle`` stays
+        # open through this whole call, and on Windows a file with an open handle cannot be
+        # unlinked (no FILE_SHARE_DELETE) -- that raised a false "being used by another
+        # process" OSError here even though publishing had already fully succeeded. The caller
+        # (see report.py:write_text_output) already closes the handle and retries this same
+        # unlink afterwards, so a failure here is never the last chance to remove ``tmp``.
         if os.path.lexists(tmp):
-            tmp.unlink()
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 def publish_dir(tmp_dir, final_dir) -> None:
@@ -178,22 +187,34 @@ def publish_dir(tmp_dir, final_dir) -> None:
 
     A folder is never replaced (there is no ``overwrite`` for folders): an existing entry of any kind at the
     final name, a link or an empty folder included, is a ``UsageError`` and ``tmp_dir`` is left for the caller
-    to remove. The name is claimed with ``mkdir``, which fails when anything is there, so an entry that appears
-    between a check and the rename is refused as well; ``tmp_dir`` then takes the place of that empty claim. The
-    folder gets the mode a normal ``mkdir`` would give (it was private while it was built).
+    to remove. The folder gets the mode a normal ``mkdir`` would give (it was private while it was built).
+
+    On POSIX the name is claimed with ``mkdir``, which fails when anything is there, so an entry that appears
+    between a check and the rename is refused as well; ``tmp_dir`` then takes the place of that empty claim
+    (plain ``rename`` would otherwise silently replace an existing *empty* directory on POSIX). On Windows
+    ``rename``/``MoveFileEx`` already refuses outright when anything -- empty or not -- exists at the
+    destination, so the claim step is unnecessary there, and worse, unusable: Windows can never rename a
+    directory onto an existing one, even one this same call just created, which is the WinError 183 this
+    function used to raise on every call.
     """
     tmp_dir, final_dir = pathlib.Path(tmp_dir), pathlib.Path(final_dir)
     exists = (f"{escape_control(final_dir.name)}: the output already exists. "
               "Choose a name that does not exist; folders are never replaced.")
     if os.path.lexists(final_dir):
         raise UsageError(exists)
+    os.chmod(tmp_dir, default_dir_mode())
+    if os.name == "nt":
+        try:
+            os.rename(tmp_dir, final_dir)
+        except FileExistsError:
+            raise UsageError(exists) from None
+        return
     try:
         os.mkdir(final_dir)
     except FileExistsError:
         raise UsageError(exists) from None
     claim = os.lstat(final_dir)
     try:
-        os.chmod(tmp_dir, default_dir_mode())
         os.rename(tmp_dir, final_dir)  # replaces the empty claim, which is ours
     except BaseException:
         try:
